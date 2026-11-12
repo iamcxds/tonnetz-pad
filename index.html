@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Tonnetz Pad — Web Simulator</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    margin: 0; padding: 18px; background: #141416; color: #c9c9d2;
+    font-family: Arial, Helvetica, sans-serif;
+    display: flex; flex-direction: column; align-items: center; gap: 10px;
+  }
+  h1 { font-size: 18px; margin: 0; letter-spacing: 1px; }
+  .hint { font-size: 12px; color: #8a8a94; margin: 0; text-align: center; max-width: 760px; }
+  #status {
+    font-size: 12px; color: #e8e4dc; background: #26262b; border: 1px solid #3c3c44;
+    border-radius: 8px; padding: 5px 12px; min-height: 16px;
+  }
+  svg { width: min(920px, 100%); height: auto; background: #e8e4dc; border-radius: 14px; touch-action: none; user-select: none; }
+  .key { cursor: pointer; }
+  .key.pressed { filter: brightness(0.78) saturate(1.3); }
+  .key.chord .outer { stroke: #f2c500 !important; stroke-width: 2.6 !important; fill: #fff3c4 !important; }
+  .key.chord .kbody { stroke: #f2c500 !important; stroke-width: 2.6 !important; fill: #4a4416 !important; }
+  svg.mode-scale .key.nat .outer { fill: #e3f0ff; stroke: #2e7fd0; stroke-width: 2.6; }
+  svg.mode-scale .key:not(.nat) { opacity: 0.45; }
+  .knob { cursor: grab; }
+  .knob.dragging { cursor: grabbing; }
+  .fbtn { cursor: pointer; }
+</style>
+</head>
+<body>
+
+<svg id="pad" viewBox="0 0 640 420" xmlns="http://www.w3.org/2000/svg" font-family="Arial, Helvetica, sans-serif" oncontextmenu="return false;">
+  <rect width="640" height="420" fill="#e8e4dc"/>
+  <rect x="20" y="20" width="600" height="380" rx="30" fill="#26262b" stroke="#3c3c44" stroke-width="2"/>
+  <g id="keyfield" transform="translate(76,24) scale(1.33)"></g>
+  <g id="knobs"></g>
+  <g id="speakers"></g>
+  <g id="btn-mode" class="fbtn">
+    <circle cx="470" cy="40" r="14" fill="#1f6fe0" stroke="#17171a" stroke-width="1.5"/>
+    <text x="470" y="44.5" text-anchor="middle" font-size="12" fill="#fff">♪</text>
+  </g>
+  <text x="300" y="36" text-anchor="middle" font-size="8" fill="#8a8a94">MODE</text>
+  <text x="608" y="392" text-anchor="end" font-size="14" font-weight="bold" fill="#c9c9d2">TONNETZ·PAD</text>
+</svg>
+<div id="status">MODE: FREE</div>
+<script>
+(function () {
+  'use strict';
+  var SVGNS = 'http://www.w3.org/2000/svg';
+  var svg = document.getElementById('pad');
+  var status = document.getElementById('status'); // needed by updateStatus during knob init
+  function el(tag, attrs, parent) {
+    var e = document.createElementNS(SVGNS, tag);
+    for (var k in attrs) e.setAttribute(k, attrs[k]);
+    if (parent) parent.appendChild(e);
+    return e;
+  }
+  function txt(parent, x, y, s, attrs) {
+    var t = el('text', Object.assign({ x: x, y: y }, attrs || {}), parent);
+    t.textContent = s;
+    return t;
+  }
+
+  // ---------- state ----------
+  var state = { octave: 0, pitch: 0, timbre: 0, volume: 80, mode: 0 };
+  // shared vars must exist before makeKnob() fires onChange -> updateStatus
+  var AC = null, master = null, voices = {};
+  var chordIv = {}; // st -> intervals of the chord being held on that key
+  var MODES = ['FREE', 'SCALE', 'CHORD'];
+  var MODE_COLORS = ['#1f6fe0', '#2ea36b', '#b06fe0'];
+  var TIMBRES = ['E.Piano', 'Sine', 'Triangle', 'Saw', 'Square', 'Organ', 'Brass', 'Flute', 'Bell', 'Strings', 'Bass', 'Pluck'];
+  var NAMES = ['C', 'C♯', 'D', 'D♯', 'E', 'F', 'F♯', 'G', 'G♯', 'A', 'A♯', 'B'];
+  var NAT = [0, 2, 4, 5, 7, 9, 11];
+
+  // ---------- key field (same geometry as the front-panel SVG) ----------
+  var NODES = [
+    [70, 50, 'C♯', 1], [140, 50, 'G♯', 1], [210, 50, 'D♯', 1], [280, 50, 'A♯', 1],
+    [100, 80, 'E', 0], [170, 80, 'B', 0], [240, 80, 'F♯', 1],
+    [60, 110, 'C', 0], [130, 110, 'G', 0], [200, 110, 'D', 0], [270, 110, 'A', 0],
+    [90, 140, 'D♯', 1], [160, 140, 'A♯', 1], [230, 140, 'F', 0], [300, 140, 'C', 0],
+    [120, 170, 'F♯', 1], [190, 170, 'C♯', 1], [260, 170, 'G♯', 1],
+    [80, 200, 'D', 0], [150, 200, 'A', 0], [220, 200, 'E', 0], [290, 200, 'B', 0],
+    [110, 230, 'F', 0], [180, 230, 'C', 0], [250, 230, 'G', 0]
+  ];
+  var kf = document.getElementById('keyfield');
+  var keyGroups = {}; // pc -> [groups]
+  var keyLabels = []; // {el, pc}
+  var lineLabels = []; // {top, bot, pc}
+
+  // pitch lines + labels
+  var pl = el('g', { id: 'pitch-lines', stroke: '#45454e', 'stroke-width': 1, opacity: 0.9 }, kf);
+  var tl = el('g', { id: 'pitch-labels-top', fill: '#8a8a94', 'font-size': 6.5, 'text-anchor': 'middle' }, kf);
+  var bl = el('g', { id: 'pitch-labels', fill: '#8a8a94', 'font-size': 6.5, 'text-anchor': 'middle' }, kf);
+  for (var x = 60; x <= 300; x += 10) {
+    var pc = ((x - 60) / 10) % 12;
+    var nat = NAT.indexOf(pc) >= 0, isC = pc === 0;
+    var attrs = { x1: x, y1: 36, x2: x, y2: 268 };
+    if (isC) { attrs.stroke = '#82828c'; attrs['stroke-width'] = 2.8; }
+    else if (nat) { attrs.stroke = '#5c5c66'; attrs['stroke-width'] = 2.2; }
+    el('line', attrs, pl);
+    var ta = {}; if (isC) { ta = { fill: '#d0d0d8', 'font-weight': 'bold' }; } else if (nat) { ta = { fill: '#b5b5bf' }; }
+    lineLabels.push({ top: txt(tl, x, 31, NAMES[pc], ta), bot: txt(bl, x, 274, NAMES[pc], ta), pc: pc });
+  }
+
+  // keys (whites first, then blacks on top)
+  function para(cx, cy, hw, hh, dy) {
+    return cx + ',' + (cy - hh) + ' ' + (cx + hw) + ',' + (cy - dy) + ' ' + cx + ',' + (cy + hh) + ' ' + (cx - hw) + ',' + (cy + dy);
+  }
+  function addKey(n) {
+    var x = n[0], y = n[1], label = n[2], black = n[3];
+    var st = (x - 60) / 10;      // column semitone: 0..24, x=180 -> +1 octave, x=300 -> +2
+    var pc = ((x - 60) / 10) % 12;
+    var g = el('g', { 'class': 'key' + (NAT.indexOf(pc) >= 0 ? ' nat' : ''), 'data-pc': pc, 'data-st': st, 'data-name': label }, kf);
+    var lt;
+    if (!black) {
+      el('polygon', { 'class': 'outer', points: para(x, y, 28.56, 28.56, 0.66), fill: '#f5f2ea', stroke: '#c9c4b8', 'stroke-width': 1.4, 'stroke-linejoin': 'round' }, g);
+      el('polygon', { points: para(x, y, 24.56, 24.56, 0.57), fill: 'none', stroke: '#e3ded2', 'stroke-width': 1, 'stroke-linejoin': 'round' }, g);
+      lt = txt(g, x, y + 5.5, label, { 'text-anchor': 'middle', 'font-size': 15, 'font-weight': 'bold', fill: '#1c1c20' });
+    } else {
+      el('polygon', { points: para(x, y + 3.2, 17.81, 17.81, 0.41), fill: '#000', opacity: 0.4, 'stroke-linejoin': 'round' }, g);
+      el('polygon', { 'class': 'kbody', points: para(x, y, 17.81, 17.81, 0.41), fill: '#17171a', stroke: '#000', 'stroke-width': 1.2, 'stroke-linejoin': 'round' }, g);
+      el('polygon', { points: para(x, y, 12.83, 12.83, 0.30), fill: '#26262c', 'stroke-linejoin': 'round' }, g);
+      lt = txt(g, x, y + 3, label, { 'text-anchor': 'middle', 'font-size': 9, 'font-weight': 'bold', fill: '#f5f2ea' });
+    }
+    keyLabels.push({ el: lt, pc: pc });
+    (keyGroups[pc] = keyGroups[pc] || []).push(g);
+    var counts = {};
+    g.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      try { g.setPointerCapture(e.pointerId); } catch (err) {}
+      counts[e.pointerId] = true;
+      if (Object.keys(counts).length === 1) { g.classList.add('pressed'); noteOn(st, pc, black); }
+    });
+    function release(e) {
+      if (!counts[e.pointerId]) return;
+      delete counts[e.pointerId];
+      if (Object.keys(counts).length === 0) { g.classList.remove('pressed'); noteOff(st); }
+    }
+    g.addEventListener('pointerup', release);
+    g.addEventListener('pointercancel', release);
+    g.addEventListener('lostpointercapture', release);
+  }
+  NODES.filter(function (n) { return !n[3]; }).forEach(addKey);
+  NODES.filter(function (n) { return n[3]; }).forEach(addKey);
+
+  // ---------- speakers ----------
+  var sp = document.getElementById('speakers');
+  [48, 534].forEach(function (x0) {
+    for (var i = 0; i < 5; i++) {
+      el('line', { x1: x0, y1: 338 + i * 10, x2: x0 + 64, y2: 338 + i * 10, stroke: '#3c3c44', 'stroke-width': 5, 'stroke-linecap': 'round' }, sp);
+    }
+  });
+
+  // ---------- knobs ----------
+  var kn = document.getElementById('knobs');
+  function makeKnob(cx, cy, label, sub, min, max, init, fmt, onChange, steps, arc) {
+    var g = el('g', { 'class': 'knob', 'data-label': label }, kn);
+    el('circle', { cx: cx, cy: cy, r: 40, fill: '#1b1b1f', stroke: '#4a4a52', 'stroke-width': 1.5 }, g);
+    // marks: stepped knobs get one mark per detent — full circle when !arc, 270° arc when arc;
+    // smooth knobs get 12 even ticks
+    function valToRel(v) {
+      if (!steps || arc) return -135 + (v - min) / (max - min) * 270;
+      return ((v - min) / (max - min) * 360) % 360;
+    }
+    var nT = steps || 12;
+    for (var i = 0; i < nT; i++) {
+      var deg = steps ? (arc ? (-135 + i * 270 / (steps - 1) - 90) : (i * 360 / steps)) : (i * 30 - 90);
+      var a = deg * Math.PI / 180;
+      el('line', {
+        x1: (cx + 31 * Math.cos(a)).toFixed(1), y1: (cy + 31 * Math.sin(a)).toFixed(1),
+        x2: (cx + 38 * Math.cos(a)).toFixed(1), y2: (cy + 38 * Math.sin(a)).toFixed(1),
+        stroke: '#6a6a74', 'stroke-width': 1.6
+      }, g);
+    }
+    el('circle', { cx: cx, cy: cy, r: 24, fill: '#34343b', stroke: '#55555e', 'stroke-width': 1.5 }, g);
+    var needle = el('line', { x1: cx, y1: cy, x2: cx, y2: cy - 20, stroke: '#e8e4dc', 'stroke-width': 3.5, 'stroke-linecap': 'round' }, g);
+    txt(g, cx, cy - 58, label, { 'text-anchor': 'middle', 'font-size': 12, 'font-weight': 'bold', fill: '#c9c9d2' });
+    var subT = txt(g, cx, cy + 56, '', { 'text-anchor': 'middle', 'font-size': 9, fill: '#8a8a94' });
+    var value = init;
+    function render(rel) {
+      needle.setAttribute('transform', 'rotate(' + rel + ' ' + cx + ' ' + cy + ')');
+      subT.textContent = sub + ' · ' + fmt(value);
+    }
+    function setFromPointer(e) {
+      var r = svg.getBoundingClientRect();
+      var px = (e.clientX - r.left) / r.width * 640 - cx;
+      var py = (e.clientY - r.top) / r.height * 420 - cy;
+      var a = Math.atan2(py, px) * 180 / Math.PI;
+      if (steps && !arc) {
+        // stepped, full-circle marks: snap to the nearest equally distributed mark
+        var relC = ((a + 90) % 360 + 360) % 360; // 0 = up, clockwise
+        var s = 360 / steps;
+        var idx = Math.round(relC / s) % steps; idx = (idx + steps) % steps;
+        value = min + idx * (max - min) / (steps - 1);
+        render(idx * 360 / steps);
+      } else {
+        // arc knob: snap to marks spread over the 270° arc; smooth knob: continuous
+        var rel = ((a + 90 + 540) % 360) - 180; // relative to "up", range [-180,180)
+        rel = Math.max(-135, Math.min(135, rel));
+        if (steps) {
+          var idx2 = Math.round((rel + 135) / 270 * (steps - 1));
+          idx2 = Math.max(0, Math.min(steps - 1, idx2));
+          value = min + idx2 * (max - min) / (steps - 1);
+          render(-135 + idx2 * 270 / (steps - 1));
+        } else {
+          value = min + (rel + 135) / 270 * (max - min);
+          render(rel);
+        }
+      }
+      onChange(value);
+    }
+    g.addEventListener('pointerdown', function (e) {
+      e.preventDefault();
+      g.classList.add('dragging');
+      try { g.setPointerCapture(e.pointerId); } catch (err) {}
+      setFromPointer(e);
+    });
+    g.addEventListener('pointermove', function (e) { if (g.classList.contains('dragging')) setFromPointer(e); });
+    function up(e) { g.classList.remove('dragging'); }
+    g.addEventListener('pointerup', up);
+    g.addEventListener('pointercancel', up);
+    render(valToRel(init));
+    onChange(init);
+    return { set: function (v) { value = v; render(valToRel(v)); } };
+  }
+  makeKnob(68, 110, 'OCTAVE', '±3 oct', -3, 3, 0, function (v) { return (v > 0 ? '+' : '') + v; }, function (v) { state.octave = v; updateStatus(); }, 7, true);
+  makeKnob(68, 250, 'PITCH', 'transpose', 0, 11, 0, function (v) { return '+' + v + ' st'; }, function (v) { state.pitch = v; applyTranspose(); updateStatus(); }, 12);
+  makeKnob(566, 110, 'TIMBRE', 'instruments', 0, 11, 0, function (v) { return TIMBRES[v]; }, function (v) { state.timbre = v; updateStatus(); }, 12);
+  makeKnob(566, 250, 'VOLUME', 'level', 0, 100, 80, function (v) { return Math.round(v) + '%'; }, function (v) { state.volume = v; if (master) master.gain.value = v / 100 * 0.9; updateStatus(); });
+
+  // ---------- audio ----------
+  function audio() {
+    if (!AC) {
+      AC = new (window.AudioContext || window.webkitAudioContext)();
+      master = AC.createGain();
+      master.gain.value = state.volume / 100 * 0.9;
+      master.connect(AC.destination);
+    }
+    if (AC.state === 'suspended') AC.resume();
+    return AC;
+  }
+  function freq(st) { return 261.63 * Math.pow(2, (st + state.pitch + state.octave * 12) / 12); }
+  function osc(type, f, t0) { var o = AC.createOscillator(); o.type = type; o.frequency.value = f; o.start(t0); return o; }
+  function makeVoice(f, t0) {
+    var c = AC, g = c.createGain(), i = state.timbre, oscs = [];
+    var atk = 0.01, rel = 0.25, peak = 0.5, selfDecay = false;
+    if (i === 8) { atk = 0.005; rel = 1.4; peak = 0.4; selfDecay = true; }        // Bell rings long
+    else if (i === 0 || i === 11) { atk = 0.005; rel = 0.7; selfDecay = true; }     // E.Piano / Pluck decay
+    if (i === 9) { atk = 0.07; rel = 0.35; }                                        // Strings swell
+    if (i === 10) { rel = 0.4; }                                                    // Bass
+    g.gain.setValueAtTime(0.0001, t0);
+    g.gain.exponentialRampToValueAtTime(peak, t0 + atk);
+    if (selfDecay) g.gain.exponentialRampToValueAtTime(0.0001, t0 + atk + rel);
+    g.connect(master);
+    function o(type, freq, gainV, dest) {
+      var osc = AC.createOscillator(); osc.type = type; osc.frequency.value = freq; osc.start(t0);
+      var node = osc;
+      if (gainV !== undefined && gainV !== 1) { var og = c.createGain(); og.gain.value = gainV; osc.connect(og); node = og; }
+      node.connect(dest || g);
+      oscs.push(osc);
+    }
+    function lp(freq) { var fl = c.createBiquadFilter(); fl.type = 'lowpass'; fl.frequency.value = freq; fl.connect(g); return fl; }
+    switch (i) {
+      case 0: o('triangle', f, 1); o('sine', f * 2, 0.35); o('sine', f * 3.01, 0.12); break;              // E.Piano
+      case 1: o('sine', f, 1); break;                                                                      // Sine
+      case 2: o('triangle', f, 1); break;                                                                  // Triangle
+      case 3: o('sawtooth', f, 1, lp(1800)); break;                                                         // Saw
+      case 4: o('square', f, 1, lp(1100)); break;                                                           // Square
+      case 5: o('sine', f, 1); o('sine', f * 2, 0.5); o('sine', f * 3, 0.25); o('sine', f * 4, 0.12); break; // Organ
+      case 6: var fl6 = lp(1200); o('sawtooth', f * 0.998, 0.5, fl6); o('sawtooth', f * 1.003, 0.5, fl6); break; // Brass
+      case 7: o('sine', f, 1); o('sine', f * 2, 0.15); o('sine', f * 1.005, 0.06); break;                    // Flute
+      case 8: o('sine', f, 1); o('sine', f * 2.76, 0.6); o('sine', f * 5.4, 0.3); o('sine', f * 8.9, 0.15); break; // Bell
+      case 9: var fl9 = lp(2500); o('sawtooth', f * 0.997, 0.4, fl9); o('sawtooth', f, 0.4, fl9); o('sawtooth', f * 1.003, 0.4, fl9); break; // Strings
+      case 10: o('sine', f / 2, 1); o('square', f, 0.3, lp(400)); break;                                    // Bass
+      case 11: o('triangle', f, 1); o('sine', f * 2, 0.3); break;                                          // Pluck
+    }
+    return {
+      stop: function () {
+        var t2 = c.currentTime;
+        g.gain.cancelScheduledValues(t2);
+        g.gain.setValueAtTime(Math.max(g.gain.value, 0.0001), t2);
+        g.gain.exponentialRampToValueAtTime(0.0001, t2 + 0.25);
+        oscs.forEach(function (o) { try { o.stop(t2 + 0.3); } catch (e) {} });
+      }
+    };
+  }
+  function noteOn(st, pc, black) {
+    audio();
+    if (voices[st]) return;
+    if (state.mode === 2) {
+      // CHORD mode: play the triad on this key — major on white keys, minor on black keys
+      var iv = black ? [0, 3, 7] : [0, 4, 7];
+      chordIv[st] = iv;
+      voices[st] = iv.map(function (d) {
+        var s2 = st + d; if (s2 > 24) s2 -= 12;
+        return makeVoice(freq(s2), AC.currentTime);
+      });
+    } else {
+      chordIv[st] = [0];
+      voices[st] = [makeVoice(freq(st), AC.currentTime)];
+    }
+    refreshChords();
+    updateStatus();
+  }
+  function noteOff(st) {
+    var vs = voices[st];
+    if (vs) { vs.forEach(function (v) { v.stop(); }); delete voices[st]; }
+    delete chordIv[st];
+    refreshChords();
+    updateStatus();
+  }
+
+  // ---------- MODE ----------
+  function cycleMode() {
+    state.mode = (state.mode + 1) % 3;
+    svg.classList.toggle('mode-scale', state.mode === 1);
+    document.querySelector('#btn-mode circle').setAttribute('fill', MODE_COLORS[state.mode]);
+    refreshChords();
+    updateStatus();
+  }
+  // highlight the triads of all currently held keys in CHORD mode
+  function refreshChords() {
+    var groups = svg.querySelectorAll('.key.chord');
+    for (var i = 0; i < groups.length; i++) groups[i].classList.remove('chord');
+    if (state.mode !== 2) return;
+    Object.keys(voices).forEach(function (k) {
+      var iv = chordIv[k] || [0];
+      var pc0 = ((Number(k) % 12) + 12) % 12;
+      iv.forEach(function (d) {
+        var p2 = (pc0 + d) % 12;
+        (keyGroups[p2] || []).forEach(function (g) { g.classList.add('chord'); });
+      });
+    });
+  }
+
+  // transpose relabels every key and pitch-line label
+  function applyTranspose() {
+    var t = state.pitch;
+    keyLabels.forEach(function (k) { k.el.textContent = NAMES[((k.pc + t) % 12 + 12) % 12]; });
+    lineLabels.forEach(function (l) {
+      var n = NAMES[((l.pc + t) % 12 + 12) % 12];
+      l.top.textContent = n; l.bot.textContent = n;
+    });
+  }
+
+  // ---------- buttons + status ----------
+  document.getElementById('btn-mode').addEventListener('click', cycleMode);
+  function updateStatus() {
+    var s = 'MODE: ' + MODES[state.mode]
+      + ' · OCTAVE ' + (state.octave > 0 ? '+' : '') + state.octave
+      + ' · PITCH ' + (state.pitch > 0 ? '+' : '') + state.pitch + ' st'
+      + ' · ' + TIMBRES[state.timbre]
+      + ' · VOL ' + Math.round(state.volume) + '%';
+    status.textContent = s;
+  }
+  updateStatus();
+})();
+</script>
+</body>
+</html>
